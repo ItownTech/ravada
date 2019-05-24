@@ -39,6 +39,8 @@ our $CONFIG = \$Ravada::CONFIG;
 our $MIN_MEMORY_MB = 128 * 1024;
 
 our $SSH_TIMEOUT = 20 * 1000;
+our $CACHE_TIMEOUT = 60;
+our $FIELD_TIMEOUT = '_data_timeout';
 
 our %VM; # cache Virtual Manager Connection
 our %SSH;
@@ -63,6 +65,7 @@ requires 'import_domain';
 requires 'is_alive';
 
 requires 'free_memory';
+requires 'free_disk';
 
 requires '_fetch_dir_cert';
 
@@ -341,7 +344,7 @@ sub _connect_ssh($self, $disconnect=0) {
 }
 
 sub _ssh_channel($self) {
-    my $ssh = $self->_connect_ssh() or confess "ERROR: Cant connect to SSH in ".$self->host;
+    my $ssh = $self->_connect_ssh() or confess "ERROR: I can't connect to SSH in ".$self->host;
     my $ssh_channel;
     for ( 1 .. 5 ) {
         $ssh_channel = $ssh->channel();
@@ -567,15 +570,29 @@ sub nat_ip($self) {
     return Ravada::nat_ip();
 }
 
-sub _interface_ip {
-    my $s = IO::Socket::INET->new(Proto => 'tcp');
+sub _interface_ip($self, $remote_ip=undef) {
+    return '127.0.0.1' if $remote_ip && $remote_ip =~ /^127\./;
+    my ($out, $err) = $self->run_command("/sbin/ip","route");
+    my %route;
+    my ($default_gw , $default_ip);
 
-    for my $if ( $s->if_list) {
-        next if $if =~ /^virbr/;
-        my $addr = $s->if_addr($if);
-        return $addr if $addr && $addr !~ /^127\./;
+    my $remote_ip_addr = NetAddr::IP->new($remote_ip);
+
+    for my $line ( split( /\n/, $out ) ) {
+        if ( $line =~ m{^default via ([\d\.]+)} ) {
+            $default_gw = NetAddr::IP->new($1);
+        }
+        if ( $line =~ m{^([\d\.\/]+).*src ([\d\.\/]+)} ) {
+            my ($network, $ip) = ($1, $2);
+            $route{$network} = $ip;
+
+            my $netaddr = NetAddr::IP->new($network);
+            return $ip if $remote_ip_addr->within($netaddr);
+
+            $default_ip = $ip if defined $default_gw && $default_gw->within($netaddr);
+        }
     }
-    return;
+    return $default_ip;
 }
 
 sub _check_memory {
@@ -627,8 +644,12 @@ sub _check_require_base {
         if keys %args;
 
     my $base = Ravada::Domain->open($id_base);
-    my %ignore_requests = map { $_ => 1 } qw(clone refresh_machine set_base_vm);
-    if (my @requests = grep { !$ignore_requests{$_->command} } $base->list_requests) {
+    my %ignore_requests = map { $_ => 1 } qw(clone refresh_machine set_base_vm start_clones);
+    my @requests;
+    for my $req ( $base->list_requests ) {
+        push @requests,($req) if !$ignore_requests{$req->command};
+    }
+    if (@requests) {
         confess "ERROR: Domain ".$base->name." has ".$base->list_requests
                             ." requests.\n"
                             .Dumper([$base->list_requests])
@@ -671,6 +692,7 @@ sub _data($self, $field, $value=undef) {
 
 #    _init_connector();
 
+    $self->_timed_data_cache()  if $self->{_data}->{$field} && $field ne 'name';
     return $self->{_data}->{$field} if exists $self->{_data}->{$field};
     return if !$self->store();
 
@@ -680,6 +702,16 @@ sub _data($self, $field, $value=undef) {
     confess "No field $field in vms"            if !exists$self->{_data}->{$field};
 
     return $self->{_data}->{$field};
+}
+
+sub _timed_data_cache($self) {
+    return if !$self->{$FIELD_TIMEOUT} || time - $self->{$FIELD_TIMEOUT} < $CACHE_TIMEOUT;
+    my $name = $self->{_data}->{name};
+    my $id = $self->{_data}->{id};
+    delete $self->{_data};
+    delete $self->{$FIELD_TIMEOUT};
+    $self->{_data}->{name} = $name  if $name;
+    $self->{_data}->{id} = $id      if $id;
 }
 
 sub _do_select_vm_db {
@@ -715,6 +747,7 @@ sub _select_vm_db {
     my ($row) = ($self->_do_select_vm_db(@_) or $self->_insert_vm_db(@_));
 
     $self->{_data} = $row;
+    $self->{$FIELD_TIMEOUT} = time if $row->{id};
     return $row if $row->{id};
 }
 
@@ -1107,7 +1140,7 @@ sub _write_file_local( $self, $file, $contents ) {
     my ($path) = $file =~ m{(.*)/};
     make_path($path) or die "$! $path"
         if ! -e $path;
-    CORE::open(my $out,">",$file) or die "$! $file";
+    CORE::open(my $out,">",$file) or confess "$! $file";
     print $out $contents;
     close $out or die "$! $file";
 }
@@ -1123,6 +1156,27 @@ sub read_file( $self, $file ) {
 sub _read_file_local( $self, $file ) {
     CORE::open my $in,'<',$file or die "$! $file";
     return join('',<$in>);
+}
+
+sub file_exists( $self, $file ) {
+    return -e $file if $self->is_local;
+
+    $self->_connect_ssh(1);
+    my ( $out, $err) = $self->run_command("/usr/bin/test",
+        "-e $file ; echo \$?");
+
+    chomp $out;
+    chomp $err;
+
+    warn $self->name." ".$err if $err;
+
+    return 1 if $out =~ /^0$/;
+    return 0;
+}
+
+sub remove_file( $self, $file ) {
+    unlink $file if $self->is_local;
+    return $self->run_command("/bin/rm", $file);
 }
 
 sub create_iptables_chain($self,$chain) {
@@ -1208,6 +1262,7 @@ sub balance_vm($self, $base=undef) {
     } else {
         @vms = $self->list_nodes();
     }
+#    warn Dumper([ map { $_->name } @vms]);
     return $self if !@vms;
     for my $vm (_random_list( @vms )) {
         next if !$vm->enabled();
@@ -1221,7 +1276,7 @@ sub balance_vm($self, $base=undef) {
 
         next if !$vm->enabled();
         next if !$active;
-        next if $base && !$base->base_in_vm($vm->id);
+        next if $base && !$vm->is_local && !$base->base_in_vm($vm->id);
 
         my $free_memory;
         eval { $free_memory = $vm->free_memory };
@@ -1238,7 +1293,9 @@ sub balance_vm($self, $base=undef) {
         $vm_list{$key} = $vm;
         last if $key =~ /^[01]+\./; # don't look for other nodes when this one is empty !
     }
-    my @sorted_vm = map { $vm_list{$_} } sort keys %vm_list;
+    my @sorted_vm = map { $vm_list{$_} } sort { $a <=> $b } keys %vm_list;
+#    warn Dumper([ map {  [$_ , $vm_list{$_}->name ] } keys %vm_list]);
+#    warn "sorted ".Dumper([ map { $_->name } @sorted_vm ]);
     for my $vm (@sorted_vm) {
         return $vm;
     }
@@ -1273,6 +1330,37 @@ sub shutdown_domains($self) {
     $sth->finish;
 }
 
+sub shared_storage($self, $node, $dir) {
+    return if !$node->is_active || !$self->is_active;
+    my $cached_st_key = "_cached_shared_storage_".$self->name.$node->name.$dir;
+    $cached_st_key =~ s{/}{_}g;
+    return $self->{$cached_st_key} if exists $self->{$cached_st_key};
+
+    $dir .= '/' if $dir !~ m{/$};
+    my $file;
+    for ( ;; ) {
+        $file = $dir.Ravada::Utils::random_name(4).".tmp";
+        eval {
+            next if $self->file_exists($file);
+            next if $node->file_exists($file);
+        };
+        return if $@ && $@ =~ /onnect to SSH/i;
+        last;
+    }
+    $file = "$dir$cached_st_key";
+    $self->write_file($file,''.localtime(time));
+    confess if !$self->file_exists($file);
+    my $shared;
+    for (1 .. 5 ) {
+        $shared = $node->file_exists($file);
+        last if $shared;
+        sleep 1;
+    }
+    $self->remove_file($file);
+
+    $self->{$cached_st_key} = $shared;
+    return $shared;
+}
 sub _fetch_tls_host_subject($self) {
     return '' if !$self->dir_cert();
 
@@ -1348,6 +1436,21 @@ sub shutdown($self) {
     die "Error: local VM can't be shut down\n" if $self->is_local;
     $self->is_active(0);
     $self->run_command_nowait('/sbin/poweroff');
+}
+
+sub _check_free_disk($self, $size, $storage_pool=undef) {
+
+    my $size_out = int($size / 1024 / 1024 / 1024 ) * 1024 *1024 *1024;
+
+    my $free = $self->free_disk($storage_pool);
+    my $free_out = int($free / 1024 / 1024 / 1024 ) * 1024 *1024 *1024;
+
+    die "Error creating volume, out of space."
+    ." Requested: ".Ravada::Utils::number_to_size($size_out)
+    ." , Disk free: ".Ravada::Utils::number_to_size($free_out)
+    ."\n"
+    if $size > $free;
+
 }
 
 1;

@@ -3,13 +3,14 @@ package Ravada;
 use warnings;
 use strict;
 
-our $VERSION = '0.4.0-alpha3';
+our $VERSION = '0.4.0';
 
 use Carp qw(carp croak);
 use Data::Dumper;
 use DBIx::Connector;
 use File::Copy;
 use Hash::Util qw(lock_hash);
+use JSON::XS;
 use Moose;
 use POSIX qw(WNOHANG);
 use Time::HiRes qw(gettimeofday tv_interval);
@@ -46,6 +47,19 @@ $ERROR_VM{Void} = $@;
 
 no warnings "experimental::signatures";
 use feature qw(signatures);
+
+our %VALID_CONFIG = (
+    vm => undef
+    ,warn_error => undef
+    ,db => {user => undef, password => undef,  hostname => undef}
+    ,ldap => { admin_user => { dn => undef, password => undef }
+        ,filter => undef
+        ,base => undef
+        ,auth => undef
+        ,admin_group => undef
+        ,ravada_posix_group => undef
+    }
+);
 
 =head1 NAME
 
@@ -204,17 +218,6 @@ sub _update_isos {
                 ,md5_url => '$url/MD5SUMS'
                 ,min_disk_size => '10'
         },
-        alpine_37 => {
-                    name => 'Alpine 3.7'
-            ,description => 'Alpine Linux 3.7 64 bits ( Minimal Linux Distribution)'
-                   ,arch => 'amd64'
-                    ,xml => 'yakkety64-amd64.xml'
-             ,xml_volume => 'yakkety64-volume.xml'
-                    ,url => 'http://dl-cdn.alpinelinux.org/alpine/v3.7/releases/x86_64/'
-                ,file_re => 'alpine-virt-3.7.\d+-x86_64.iso'
-                ,sha256_url => 'http://dl-cdn.alpinelinux.org/alpine/v3.7/releases/x86_64/alpine-virt-3.7.\d+-x86_64.iso.sha256'
-                ,min_disk_size => '1'
-        }
         ,bionic=> {
                     name => 'Ubuntu Bionic Beaver'
             ,description => 'Ubuntu 18.04 Bionic Beaver 64 bits'
@@ -916,19 +919,29 @@ sub _alias_grants($self) {
 }
 
 sub _add_grants($self) {
-    $self->_add_grant('shutdown', 1,"Can shutdown own virtual machines");
-    $self->_add_grant('screenshot', 1,"Can get a screenshot of own virtual machines");
-    $self->_add_grant('start_many',0,"Can have more than one machine started")
+    $self->_add_grant('rename', 0,"Can rename any virtual machine owned by the user.");
+    $self->_add_grant('rename_all', 0,"Can rename any virtual machine.");
+    $self->_add_grant('rename_clones', 0,"Can rename clones from virtual machines owned by the user.");
+    $self->_add_grant('shutdown', 1,"Can shutdown own virtual machines.");
+    $self->_add_grant('screenshot', 1,"Can get a screenshot of own virtual machines.");
+    $self->_add_grant('start_many',0,"Can have more than one machine started.")
 }
 
 sub _add_grant($self, $grant, $allowed, $description) {
     my $sth = $CONNECTOR->dbh->prepare(
-        "SELECT id FROM grant_types WHERE name=?"
+        "SELECT id, description FROM grant_types WHERE name=?"
     );
     $sth->execute($grant);
-    my ($id) = $sth->fetchrow();
+    my ($id, $current_description) = $sth->fetchrow();
     $sth->finish;
 
+    if ($id && $current_description ne $description) {
+        my $sth = $CONNECTOR->dbh->prepare(
+            "UPDATE grant_types SET description = ? WHERE id = ?;"
+        );
+        $sth->execute($description, $id);
+        $sth->finish;
+    }
     return if $id;
 
     $sth = $CONNECTOR->dbh->prepare("INSERT INTO grant_types (name, description)"
@@ -979,6 +992,7 @@ sub _enable_grants($self) {
         ,'clone',           'clone_all',            'create_base', 'create_machine'
         ,'grant'
         ,'manage_users'
+        ,'rename', 'rename_all', 'rename_clones'
         ,'remove',          'remove_all',   'remove_clone',     'remove_clone_all'
         ,'screenshot'
         ,'shutdown',        'shutdown_all',    'shutdown_clone'
@@ -1039,9 +1053,21 @@ sub _upgrade_table {
     my ($table, $field, $definition) = @_;
     my $dbh = $CONNECTOR->dbh;
 
+    my ($new_size) = $definition =~ m{\((\d+)};
+
     my $sth = $dbh->column_info(undef,undef,$table,$field);
     my $row = $sth->fetchrow_hashref;
     $sth->finish;
+    if ( $dbh->{Driver}{Name} =~ /mysql/
+        && $row && $row->{COLUMN_SIZE}
+        && $new_size
+        && $new_size != $row->{COLUMN_SIZE}) {
+
+        $dbh->do("alter table $table change $field $field $definition");
+        warn "INFO: changing $field $row->{COLUMN_SIZE} to $new_size in $table\n"  if $0 !~ /\.t$/;
+        return;
+    }
+
     return if $row;
 
     warn "INFO: adding $field $definition to $table\n"  if $0 !~ /\.t$/;
@@ -1156,6 +1182,8 @@ sub _upgrade_tables {
     $self->_upgrade_table('requests','at_time','int(11) DEFAULT NULL');
     $self->_upgrade_table('requests','pid','int(11) DEFAULT NULL');
     $self->_upgrade_table('requests','start_time','int(11) DEFAULT NULL');
+    $self->_upgrade_table('requests','output','text DEFAULT NULL');
+    $self->_upgrade_table('requests','after_request','int(11) DEFAULT NULL');
 
     $self->_upgrade_table('requests','at_time','int(11) DEFAULT NULL');
     $self->_upgrade_table('requests','run_time','float DEFAULT NULL');
@@ -1190,7 +1218,7 @@ sub _upgrade_tables {
     $self->_upgrade_table('domains','autostart','int NOT NULL DEFAULT 0');
 
     $self->_upgrade_table('domains','status','varchar(32) DEFAULT "shutdown"');
-    $self->_upgrade_table('domains','display','varchar(128) DEFAULT NULL');
+    $self->_upgrade_table('domains','display','varchar(250) DEFAULT NULL');
     $self->_upgrade_table('domains','display_file','text DEFAULT NULL');
     $self->_upgrade_table('domains','info','varchar(255) DEFAULT NULL');
     $self->_upgrade_table('domains','internal_id','varchar(64) DEFAULT NULL');
@@ -1269,6 +1297,7 @@ sub _init_config {
     eval { $CONFIG = YAML::LoadFile($file) };
 
     die "ERROR: Format error in config file $file\n$@"  if $@;
+    _check_config($CONFIG);
 
     if ( !$CONFIG->{vm} ) {
         my %default_vms = %VALID_VM;
@@ -1319,6 +1348,24 @@ sub _create_vm_kvm {
     $vm_kvm = undef if !$internal_vm || !$storage;
 
     return $vm_kvm;
+}
+
+sub _check_config($config_orig = {} , $valid_config = \%VALID_CONFIG ) {
+    return 1 if !defined $config_orig;
+    my %config = %$config_orig;
+
+    for my $key (sort keys %$valid_config) {
+        if ( $config{$key} && ref($valid_config->{$key})) {
+           my $ok = _check_config( $config{$key} , $valid_config->{$key} );
+           return 0 if !$ok;
+        }
+        delete $config{$key};
+    }
+    if ( keys %config ) {
+        warn "Error: Unknown config entry \n".Dumper(\%config) if ! $0 =~ /\.t$/;
+        return 0;
+    }
+    return 1;
 }
 
 =head2 disconnect_vm
@@ -1568,6 +1615,9 @@ sub remove_domain {
     my $user = Ravada::Auth::SQL->search_by_id( $arg{uid});
     die "Error: user ".$user->name." can't remove domain $id"
         if !$user->can_remove_machine($id);
+
+    my $domain0 = Ravada::Domain->open( $id );
+    $domain0->shutdown_now($user) if $domain0 && $domain0->is_active;
 
     my $vm = Ravada::VM->open(type => $vm_type);
     my $domain = Ravada::Domain->open(id => $id, _force => 1, id_vm => $vm->id)
@@ -1988,6 +2038,8 @@ sub process_requests {
         warn $@ if $@;
         next if !$req;
 
+        next if !$req->requirements_done;
+
         next if $request_type ne 'all' && $req->type ne $request_type;
 
         next if $req->command !~ /shutdown/i
@@ -2250,6 +2302,7 @@ sub _execute {
     if ( $pid == 0 ) {
         $request->status('working','');
         my $t0 = [gettimeofday];
+        srand();
         $self->_do_execute_command($sub, $request);
         my $elapsed = tv_interval($t0,[gettimeofday]);
         $request->run_time($elapsed) if !$request->run_time();
@@ -2283,20 +2336,6 @@ sub _do_execute_command {
     $request->status('done')
         if $request->status() ne 'done'
             && $request->status() !~ /^retry/i;
-
-}
-
-sub _cmd_domdisplay {
-    my $self = shift;
-    my $request = shift;
-
-    my $name = $request->args('name');
-    confess "Unknown name for request ".Dumper($request)  if!$name;
-    my $domain = $self->search_domain($request->args->{name});
-    my $user = Ravada::Auth::SQL->search_by_id( $request->args->{uid});
-    $request->error('');
-    my $display = $domain->display($user);
-    $request->result({display => $display});
 
 }
 
@@ -2440,6 +2479,8 @@ sub _cmd_pause {
     my $uid = $request->args('uid');
     my $user = Ravada::Auth::SQL->search_by_id($uid);
 
+    $self->_remove_unnecessary_downs($domain);
+
     $domain->pause($user);
 
     $request->status('done');
@@ -2457,6 +2498,7 @@ sub _cmd_resume {
     my $uid = $request->args('uid');
     my $user = Ravada::Auth::SQL->search_by_id($uid);
 
+    $self->_remove_unnecessary_downs($domain);
     $domain->resume(
         remote_ip => $request->args('remote_ip')
         ,user => $user
@@ -2517,6 +2559,8 @@ sub _cmd_start {
     my $uid = $request->args('uid');
     my $user = Ravada::Auth::SQL->search_by_id($uid);
 
+    $self->_remove_unnecessary_downs($domain);
+
     $domain->start(user => $user, remote_ip => $request->args('remote_ip'));
     my $msg = 'Domain '
             ."<a href=\"/machine/view/".$domain->id.".html\">"
@@ -2526,6 +2570,35 @@ sub _cmd_start {
     $request->status('done', $msg);
 
 }
+
+sub _cmd_dettach($self, $request) {
+    my $domain = Ravada::Domain->open($request->id_domain);
+
+    my $user = Ravada::Auth::SQL->search_by_id($request->args('uid'));
+    die "Error: ".$user->name." not authorized to dettach domain"
+        if !$user->is_admin;
+
+    $domain->dettach($user);
+}
+
+sub _cmd_rebase_volumes($self, $request) {
+    my $domain = Ravada::Domain->open($request->id_domain);
+
+    my $user = Ravada::Auth::SQL->search_by_id($request->args('uid'));
+    die "Error: ".$user->name." not authorized to dettach domain"
+        if !$user->is_admin;
+
+    if ($domain->is_active) {
+        Ravada::Request->shutdown_domain(uid => $user->id, id_domain => $domain->id, timeout => 120);
+        $request->status("requested");
+        die "Error: domain ".$domain->name." is still active, shut it down to rebase\n"
+    }
+    $request->status('working');
+
+    my $new_base = Ravada::Domain->open($request->args('id_base'));
+    $domain->rebase_volumes($new_base);
+}
+
 
 sub _cmd_start_clones {
     my $self = shift;
@@ -2576,6 +2649,7 @@ sub _cmd_prepare_base {
 
     die "Unknown domain id '$id_domain'\n" if !$domain;
 
+    $self->_remove_unnecessary_downs($domain);
     $domain->prepare_base($user);
 
 }
@@ -2828,6 +2902,7 @@ sub _cmd_refresh_machine($self, $request) {
     my $domain = Ravada::Domain->open($id_domain) or confess "Error: domain $id_domain not found";
     $domain->list_volumes_info();
     $domain->info($user);
+    $self->_remove_unnecessary_downs($domain);
 
 }
 
@@ -2862,6 +2937,7 @@ sub _cmd_refresh_vms($self, $request=undef) {
 
     my ($active_domain, $active_vm) = $self->_refresh_active_domains($request);
     $self->_refresh_down_domains($active_domain, $active_vm);
+    $self->_remove_unnecessary_downs();
 
     $self->_clean_requests('refresh_vms', $request);
     $self->_refresh_volatile_domains();
@@ -2932,6 +3008,19 @@ sub _cmd_connect_node($self, $request) {
         die $err if $err;
     }
     $node->connect() && $request->error("Connection OK");
+}
+
+sub _cmd_list_network_interfaces($self, $request) {
+
+    my $vm_type = $request->args('vm_type');
+    my $type = $request->defined_arg('type');
+    my @type;
+    @type = ( $type ) if $type;
+
+    my $vm = Ravada::VM->open( type => $vm_type );
+    my @ifs = $vm->list_network_interfaces( @type );
+
+    $request->output(encode_json(\@ifs));
 }
 
 sub _clean_requests($self, $command, $request=undef) {
@@ -3062,6 +3151,18 @@ sub _refresh_down_domains($self, $active_domain, $active_vm) {
     }
 }
 
+sub _remove_unnecessary_downs($self, @domains) {
+    @domains = $self->list_domains( active => 0 ) if !scalar @domains;
+
+    for my $domain (@domains) {
+        my @requests = $domain->list_requests(1);
+        for my $req (@requests) {
+            $req->status('done') if $req->command =~ /shutdown/;
+            $req->_remove_messages();
+        }
+    }
+}
+
 sub _refresh_volatile_domains($self) {
    my $sth = $CONNECTOR->dbh->prepare(
         "SELECT id, name, id_vm FROM domains WHERE is_volatile=1"
@@ -3137,12 +3238,12 @@ sub _req_method {
         ,create => \&_cmd_create
         ,remove => \&_cmd_remove
         ,resume => \&_cmd_resume
+       ,dettach => \&_cmd_dettach
        ,cleanup => \&_cmd_cleanup
       ,download => \&_cmd_download
       ,shutdown => \&_cmd_shutdown
      ,hybernate => \&_cmd_hybernate
     ,set_driver => \&_cmd_set_driver
-    ,domdisplay => \&_cmd_domdisplay
     ,screenshot => \&_cmd_screenshot
     ,add_disk => \&_cmd_add_disk
     ,copy_screenshot => \&_cmd_copy_screenshot
@@ -3158,6 +3259,7 @@ sub _req_method {
  ,list_vm_types => \&_cmd_list_vm_types
 ,enforce_limits => \&_cmd_enforce_limits
 ,force_shutdown => \&_cmd_force_shutdown
+,rebase_volumes => \&_cmd_rebase_volumes
 ,refresh_storage => \&_cmd_refresh_storage
 ,refresh_machine => \&_cmd_refresh_machine
 ,refresh_vms => \&_cmd_refresh_vms
@@ -3175,6 +3277,9 @@ sub _req_method {
 
     #users
     ,post_login => \&_cmd_post_login
+
+    #networks
+    ,list_network_interfaces => \&_cmd_list_network_interfaces
     );
     return $methods{$cmd};
 }

@@ -48,6 +48,28 @@ sub test_reuse_vm($node) {
 
     is($clone2->is_local, 1 );
     test_remove($clone2, $node);
+
+}
+
+sub test_remove_req($vm, $node) {
+    my $domain = create_domain($node->type);
+    $domain->prepare_base(user_admin);
+    $domain->set_base_vm(vm => $node, user => user_admin);
+
+    my $clone1 = $domain->clone(name => new_domain_name, user => user_admin);
+    $clone1->migrate($node);
+
+    my $req = Ravada::Request->remove_domain(
+               uid => user_admin->id
+             ,name => $clone1->name
+    );
+
+    rvd_back->_process_requests_dont_fork(1);
+
+    is($req->status, 'done');
+    is($req->error, '');
+
+    $domain->remove(user_admin);
 }
 
 sub test_remove($clone, $node) {
@@ -215,7 +237,39 @@ sub _create_2_clones_same_port($vm, $node, $base, $ip_local, $ip_remote) {
             $clone_remote->start(user => user_admin, remote_ip => $ip_remote);
         }
     }
-    die;
+}
+
+sub test_set_vm($vm, $node) {
+    my $base = create_domain($vm);
+    my $info = $base->info(user_admin);
+    is($info->{bases}->{$vm->id},0);
+
+    my $req = Ravada::Request->set_base_vm(
+        id_domain => $base->id
+        , id_vm => $node->id
+        , value => 1
+        , uid => user_admin->id
+    );
+    rvd_back->_process_requests_dont_fork(1);
+    is($req->status, 'done');
+    is($req->error, '');
+
+    is($base->_vm->id, $vm->id);
+
+    my $base2 = Ravada::Domain->open($base->id);
+    is($base2->_vm->id, $vm->id);
+
+    $info = $base2->info(user_admin);
+    is($info->{bases}->{$vm->id},1,Dumper($info->{bases})) or exit;
+    is($info->{bases}->{$node->id},1,$node->id." "
+        .Dumper($info->{bases})) or exit;
+
+    my $base_f = Ravada::Front::Domain->open($base->id);
+    $info = $base_f->info(user_admin);
+    is($info->{bases}->{$vm->id},1) or exit;
+    is($info->{bases}->{$node->id},1) or exit;
+
+    $base->remove(user_admin);
 }
 
 sub test_volatile($vm, $node) {
@@ -225,7 +279,7 @@ sub test_volatile($vm, $node) {
     $base->volatile_clones(1);
 
     my @clones;
-    for ( 1 .. 4 ) {
+    for ( 1 .. 10 ) {
         my $clone = $base->clone(user => user_admin, name => new_domain_name);
         is($clone->_vm->is_active,1);
         is($clone->is_active(),1,"Expecting clone ".$clone->name." active on ".$clone->_vm->name);
@@ -433,7 +487,11 @@ for my $vm_name ( 'Void', 'KVM') {
         };
         is($node->is_local,0,"Expecting ".$node->name." ".$node->ip." is remote" ) or BAIL_OUT();
 
+        test_set_vm($vm, $node);
+
         test_volatile($vm, $node);
+
+        test_remove_req($vm, $node);
 
         for my $volatile (1,0) {
         test_remove_base($vm, $node, $volatile);

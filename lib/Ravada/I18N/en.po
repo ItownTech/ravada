@@ -794,3 +794,21 @@ msgstr ""
 
 msgid "Start all clones"
 msgstr ""
+
+msgid "Access denied"
+msgstr ""
+
+msgid "Empty login name"
+msgstr ""
+
+msgid "Empty password"
+msgstr ""
+
+msgid "Session timeout"
+msgstr ""
+
+msgid "Vietnamese"
+msgstr ""
+
+msgid "Italian"
+msgstr ""

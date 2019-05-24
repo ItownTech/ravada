@@ -11,7 +11,6 @@
     </div>
 
 <div class="row" ng-repeat="node in nodes">
-
     <div class="col-md-1" ng-show="{{node.type == showmachine.type}}">
         <input type="checkbox" ng-checked="showmachine.bases[node.id]"
             ng-click="set_base(node.id, showmachine.id, !showmachine.bases[node.id])"
@@ -20,7 +19,7 @@
                 || showmachine.clones[node.id]
                 || ( node.is_local && showmachine.has_clones)">
     </div>
-    <div class="col-md-2" ng-show="{{node.type == showmachine.type}}">
+    <div class="col-md-3" ng-show="{{node.type == showmachine.type}}">
         {{node.name}}
     </div>
     <div class="col-md-4" ng-show="{{node.type == showmachine.type}}">

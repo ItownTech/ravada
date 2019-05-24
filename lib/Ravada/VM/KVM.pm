@@ -77,6 +77,9 @@ our $CONNECTOR = \$Ravada::CONNECTOR;
 our $WGET = `which wget`;
 chomp $WGET;
 
+our $BRCTL = `which brctl`;
+chomp $BRCTL;
+
 our $CACHE_DOWNLOAD = 1;
 our $VERIFY_ISO = 1;
 
@@ -176,7 +179,7 @@ sub _load_storage_pool {
     my $vm_pool;
     my $available;
 
-    if (defined $self->default_storage_pool_name) {
+    if ($self->default_storage_pool_name) {
         return( $self->vm->get_storage_pool_by_name($self->default_storage_pool_name)
             or confess "ERROR: Unknown storage pool: ".$self->default_storage_pool_name);
     }
@@ -821,6 +824,7 @@ sub _domain_create_common {
     $self->_fix_pci_slots($xml);
     $self->_xml_add_guest_agent($xml);
     $self->_xml_clean_machine_type($xml) if !$self->is_local;
+    $self->_xml_add_sysinfo_entry($xml, hostname => $args{name});
 
     my $dom;
 
@@ -1886,6 +1890,37 @@ sub _xml_clean_machine_type($self, $doc) {
     $os_type->setAttribute( machine => 'pc');
 }
 
+sub _xml_add_sysinfo($self,$doc) {
+    my ($smbios) = $doc->findnodes('/domain/os/smbios');
+    if (!$smbios) {
+        my ($os) = $doc->findnodes('/domain/os');
+        $smbios = $os->addNewChild(undef,'smbios');
+    }
+    $smbios->setAttribute(mode => 'sysinfo');
+
+}
+
+sub _xml_add_sysinfo_entry($self, $doc, $field, $value) {
+    $self->_xml_add_sysinfo($doc);
+    my ($oemstrings) = $doc->findnodes('/domain/sysinfo/oemStrings');
+    if (!$oemstrings) {
+        my ($domain) = $doc->findnodes('/domain');
+        my $sysinfo = $domain->addNewChild(undef,'sysinfo');
+        $sysinfo->setAttribute( type => 'smbios' );
+        $oemstrings = $sysinfo->addNewChild(undef,'oemStrings');
+    }
+    my @entries = $oemstrings->findnodes('entry');
+    my $hostname;
+    for (@entries) {
+        $hostname = $_ if $_->textContent =~ /^$field/;
+    }
+    if ($hostname) {
+        $oemstrings->removeChild($hostname);
+    }
+    ($hostname) = $oemstrings->addNewChild(undef,'entry');
+    $hostname->appendText("$field: $value");
+}
+
 sub _xml_remove_cdrom {
     my $doc = shift;
 
@@ -2152,7 +2187,13 @@ Returns true if the virtual manager connection is active, false otherwise.
 
 sub is_alive($self) {
     return 0 if !$self->vm;
-    return 1 if $self->vm->is_alive;
+    my $is_alive = $self->vm->is_alive;
+    return 0 if !$is_alive;
+    eval {
+        $self->vm->get_hostname();
+    };
+    warn $@ if $@;
+    return 1 if !$@;
     return 0;
 }
 
@@ -2192,6 +2233,7 @@ sub _free_memory_available($self) {
         $used += $memory;
     }
     my $free_mem = $info->{total} - $used;
+    $free_mem = 0 if $free_mem < 0;
     my $free_real = $self->_free_memory_overcommit;
 
     $free_mem = $free_real if $free_real < $free_mem;
@@ -2212,6 +2254,87 @@ sub _fetch_dir_cert($self) {
         return $1 if $1;
     }
     close $in;
+}
+
+sub list_network_interfaces($self, $type) {
+    my $sub = {
+        nat => \&_list_nat_interfaces
+        ,bridge => \&_list_bridges
+    };
+
+    my $cmd = $sub->{$type} or confess "Error: Unknown interface type $type";
+    return $cmd->($self);
+}
+
+sub _list_nat_interfaces($self) {
+
+    my ($in, $out, $err);
+    my @cmd = ( '/usr/bin/virsh','net-list');
+    run3(\@cmd, \$in, \$out, \$err);
+
+    my @lines = split /\n/,$out;
+    shift @lines;
+    shift @lines;
+
+    my @networks;
+    for (@lines) {
+        /\s*(.*?)\s+.*/;
+        push @networks,($1) if $1;
+    }
+    return @networks;
+}
+
+sub _get_nat_bridge($net) {
+    my ($in, $out, $err);
+    my @cmd = ( '/usr/bin/virsh','net-info', $net);
+    run3(\@cmd, \$in, \$out, \$err);
+
+    for my $line (split /\n/, $out) {
+        my ($bridge) = $line =~ /^Bridge:\s+(.*)/;
+        return $bridge if $bridge;
+    }
+}
+
+sub _list_qemu_bridges($self) {
+    my %bridge;
+    my @networks = $self->_list_nat_interfaces();
+    for my $net (@networks) {
+        my $nat_bridge = _get_nat_bridge($net);
+        $bridge{$nat_bridge}++;
+    }
+    return keys %bridge;
+}
+
+sub _list_bridges($self) {
+
+    return () if !-e $BRCTL;
+    my %qemu_bridge = map { $_ => 1 } $self->_list_qemu_bridges();
+
+    my @cmd = ( $BRCTL,'show');
+    my ($out,$err) = $self->run_command(@cmd);
+
+    die $err if $err;
+    my @lines = split /\n/,$out;
+    shift @lines;
+
+    my @networks;
+    for (@lines) {
+        my ($bridge, $interface) = /\s*(.*?)\s+.*\s(.*)/;
+        push @networks,($bridge) if $bridge && !$qemu_bridge{$bridge};
+    }
+    $self->{_bridges} = \@networks;
+    return @networks;
+}
+
+sub free_disk($self, $pool_name = undef ) {
+    my $pool;
+    if ($pool_name) {
+        $pool = $self->vm->get_storage_pool_by_name($pool_name);
+    } else {
+        $pool = $self->storage_pool();
+    }
+    my $info = $pool->get_info();
+    return $info->{available};
 }
 
 1;

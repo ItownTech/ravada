@@ -132,6 +132,7 @@ sub create_domain {
         $domain->add_volume(name => $cdrom_name
                         , file => $cdrom_file
                         , device => 'cdrom'
+                        , type => 'cdrom'
                         , target => 'hdc'
         );
         $domain->_set_default_drivers();
@@ -322,6 +323,15 @@ sub free_memory {
 
 sub _fetch_dir_cert {
     confess "TODO";
+}
+
+sub free_disk($self, $storage_pool = undef) {
+    my $df = `df`;
+    for my $line (split /\n/, $df) {
+        my @info = split /\s+/,$line;
+        return $info[3] * 1024 if $info[5] eq '/';
+    }
+    die "Not found";
 }
 #########################################################################3
 
